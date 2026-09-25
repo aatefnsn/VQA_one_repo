@@ -1,3 +1,15 @@
+## Model Checkpoint
+
+The trained model checkpoint (`checkpoint_17_Ahmed_768_new.pth.tar`, ~500MB) is too large for regular git and is hosted as a [GitHub Release asset](https://github.com/aatefnsn/VQA_one_repo/releases/tag/model-v1) instead.
+
+Download it before building/running locally:
+
+```bash
+bash download_model_from_release.sh
+```
+
+Or manually place it in the repo root or `app/` folder from the [release page](https://github.com/aatefnsn/VQA_one_repo/releases/download/model-v1/checkpoint_17_Ahmed_768_new.pth.tar).
+
 ![A screenshot of a video chat AI-generated content may be
 incorrect.](./media/image1.png){width="6.5in"
 height="3.5881944444444445in"}
