@@ -1,0 +1,312 @@
+name: Deploy to Azure Container Apps
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:  # Allows manual trigger from GitHub UI
+
+env:
+  AZURE_RG: vqa-rg
+  AZURE_REGISTRY: vqaregistry
+  AZURE_CONTAINER_APP: vqa-backend
+  IMAGE_NAME: vqa-backend
+  AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+  AZURE_CONTAINER_NAME: ${{ secrets.AZURE_CONTAINER_NAME }}
+  MODEL_BLOB_NAME: ${{ secrets.MODEL_BLOB_NAME }}
+
+jobs:
+  build-and-registry:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+      previous_version: ${{ steps.get-version.outputs.previous_version }}
+      previous_image: ${{ steps.store-previous.outputs.previous_image }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y jq
+    
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    
+    - name: Get latest version from ACR
+      id: get-version
+      run: |
+        set -e
+        # Get all tags from ACR and find the latest version number
+        TAGS=$(az acr repository show-tags --name ${{ env.AZURE_REGISTRY }} --repository ${{ env.IMAGE_NAME }} --orderby time_desc --output json 2>/dev/null || echo '[]')
+        
+        LATEST_VERSION=0
+        for tag in $(echo "$TAGS" | jq -r '.[]'); do
+          if [[ $tag =~ ^v([0-9]+)$ ]]; then
+            VERSION_NUM=${BASH_REMATCH[1]}
+            if [ $VERSION_NUM -gt $LATEST_VERSION ]; then
+              LATEST_VERSION=$VERSION_NUM
+            fi
+          fi
+        done
+        
+        NEW_VERSION=$((LATEST_VERSION + 1))
+        VERSION_TAG="v$NEW_VERSION"
+        PREVIOUS_VERSION="v$LATEST_VERSION"
+        
+        echo "Current version: $PREVIOUS_VERSION"
+        echo "New version: $VERSION_TAG"
+        echo "version=$VERSION_TAG" >> $GITHUB_OUTPUT
+        echo "previous_version=$PREVIOUS_VERSION" >> $GITHUB_OUTPUT
+    
+    - name: Validate Dockerfile exists
+      run: |
+        if [ ! -f Dockerfile ]; then
+          echo "Error: Dockerfile not found in repository root"
+          exit 1
+        fi
+    
+    - name: Verify secrets are configured
+      run: |
+        echo "Checking GitHub secrets..."
+        if [ -z "${{ secrets.AZURE_STORAGE_ACCOUNT }}" ]; then echo "❌ AZURE_STORAGE_ACCOUNT not set"; exit 1; fi
+        if [ -z "${{ secrets.AZURE_CONTAINER_NAME }}" ]; then echo "❌ AZURE_CONTAINER_NAME not set"; exit 1; fi
+        if [ -z "${{ secrets.MODEL_BLOB_NAME }}" ]; then echo "❌ MODEL_BLOB_NAME not set"; exit 1; fi
+        if [ -z "${{ secrets.AZURE_SAS_TOKEN }}" ]; then echo "❌ AZURE_SAS_TOKEN not set"; exit 1; fi
+        echo "✓ All secrets are configured"
+    
+    - name: Download model from Azure Blob Storage
+      env:
+        SAS_TOKEN: ${{ secrets.AZURE_SAS_TOKEN }}
+        STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+        CONTAINER_NAME: ${{ secrets.AZURE_CONTAINER_NAME }}
+        MODEL_BLOB: ${{ secrets.MODEL_BLOB_NAME }}
+      run: |
+        echo "Downloading model from Azure Blob Storage..."
+        echo "Storage Account: ${STORAGE_ACCOUNT}"
+        echo "Container: ${CONTAINER_NAME}"
+        echo "Blob Name: ${MODEL_BLOB}"
+        SAS_URL="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER_NAME}/${MODEL_BLOB}?${SAS_TOKEN}"
+        echo "URL Pattern: https://[account].blob.core.windows.net/[container]/[blob]?[token]"
+        
+        curl -f --max-time 3600 "$SAS_URL" -o checkpoint_17_Ahmed_768_new.pth.tar
+        
+        # Verify file size
+        FILE_SIZE=$(stat -c%s checkpoint_17_Ahmed_768_new.pth.tar 2>/dev/null || stat -f%z checkpoint_17_Ahmed_768_new.pth.tar)
+        FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+        echo "Downloaded file size: ${FILE_SIZE_MB} MB"
+        
+        if [ $FILE_SIZE -lt 500000000 ]; then
+          echo "ERROR: Model file too small (${FILE_SIZE_MB} MB), download may have failed"
+          exit 1
+        fi
+        
+        echo "✓ Model downloaded successfully"
+        
+        # Ensure file is in build context for ACR
+        ls -lh checkpoint_17_Ahmed_768_new.pth.tar
+    
+    - name: Build image in ACR
+      run: |
+        echo "Building Docker image in Azure Container Registry..."
+        echo "Verifying model file exists before build..."
+        if [ -f checkpoint_17_Ahmed_768_new.pth.tar ]; then
+          ls -lh checkpoint_17_Ahmed_768_new.pth.tar
+          echo "✓ Model file found in build context"
+        else
+          echo "❌ ERROR: Model file NOT found in build context!"
+          echo "Current directory contents:"
+          ls -lh | grep -i checkpoint || true
+          exit 1
+        fi
+        
+        az acr build \
+          --registry vqaregistry \
+          --image vqa-backend:${{ steps.get-version.outputs.version }} \
+          --platform linux/amd64 \
+          --file Dockerfile \
+          ./
+        
+        echo "✓ Image built successfully: ${{ steps.get-version.outputs.version }}"
+    
+    - name: Store previous version
+      id: store-previous
+      run: |
+        # Store the previous image tag for potential rollback
+        if [ "${{ steps.get-version.outputs.previous_version }}" != "v0" ]; then
+          echo "previous_image=${{ env.AZURE_REGISTRY }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.get-version.outputs.previous_version }}" >> $GITHUB_OUTPUT
+        else
+          echo "previous_image=" >> $GITHUB_OUTPUT
+        fi
+
+  deploy:
+    needs: build-and-registry
+    runs-on: ubuntu-latest
+    outputs:
+      container_url: ${{ steps.get-url.outputs.url }}
+    
+    steps:
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    
+    - name: Deploy new version
+      id: deploy
+      run: |
+        set -e
+        echo "Deploying new version: ${{ needs.build-and-registry.outputs.version }}"
+        az containerapp update \
+          --name ${{ env.AZURE_CONTAINER_APP }} \
+          --resource-group ${{ env.AZURE_RG }} \
+          --image ${{ env.AZURE_REGISTRY }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ needs.build-and-registry.outputs.version }}
+        
+        echo "✓ Deployment completed"
+    
+    - name: Get Container App URL
+      id: get-url
+      run: |
+        set -e
+        URL=$(az containerapp show \
+          --name ${{ env.AZURE_CONTAINER_APP }} \
+          --resource-group ${{ env.AZURE_RG }} \
+          --query "properties.configuration.ingress.fqdn" \
+          -o tsv)
+        echo "url=https://$URL" >> $GITHUB_OUTPUT
+    
+    - name: Wait for container to start
+      run: |
+        echo "Waiting for container to be ready..."
+        echo "This may take longer due to model initialization at startup..."
+        sleep 60
+    
+    - name: Health check - Test endpoint responsiveness
+      id: health-check
+      run: |
+        set +e
+        MAX_ATTEMPTS=20
+        ATTEMPT=1
+        
+        echo "Starting health checks..."
+        while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+          echo "Attempt $ATTEMPT/$MAX_ATTEMPTS..."
+          
+          # Test health endpoint
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            --connect-timeout 5 \
+            --max-time 10 \
+            "${{ steps.get-url.outputs.url }}/health")
+          
+          echo "  Health endpoint returned: $HTTP_CODE"
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✓ Container is healthy!"
+            echo "health_check_status=passed" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+            echo "  Waiting before retry..."
+            sleep 10
+          fi
+          
+          ATTEMPT=$((ATTEMPT + 1))
+        done
+        
+        echo "✗ Health check failed!"
+        echo "health_check_status=failed" >> $GITHUB_OUTPUT
+        exit 1
+    
+    - name: Get container logs for debugging
+      if: failure()
+      run: |
+        echo "Retrieving container logs..."
+        az containerapp logs show \
+          --name ${{ env.AZURE_CONTAINER_APP }} \
+          --resource-group ${{ env.AZURE_RG }} \
+          --tail 100 || echo "Could not retrieve logs"
+        
+        echo ""
+        echo "Checking container app status..."
+        az containerapp show \
+          --name ${{ env.AZURE_CONTAINER_APP }} \
+          --resource-group ${{ env.AZURE_RG }} \
+          --query "{status: properties.runningStatus, provisioning: properties.provisioningState}" \
+          -o json || echo "Could not retrieve status"
+
+  unit-tests:
+    needs: [build-and-registry, deploy]
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install test dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest requests
+    
+    - name: Run integration tests against deployed container
+      env:
+        CONTAINER_URL: ${{ needs.deploy.outputs.container_url }}
+      run: |
+        echo "Running integration tests against deployed container..."
+        echo "Container URL: ${CONTAINER_URL}"
+        python -m pytest test_integration.py -v --tb=short -s
+    
+    - name: Test Summary
+      if: success()
+      run: |
+        echo "### ✅ All Tests Passed!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Version:** ${{ needs.build-and-registry.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Container URL:** ${{ needs.deploy.outputs.container_url }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Integration Tests:** ✓ Passed" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "New container image is now live." >> $GITHUB_STEP_SUMMARY
+
+  rollback-on-test-failure:
+    needs: [build-and-registry, deploy, unit-tests]
+    runs-on: ubuntu-latest
+    if: failure() && needs.build-and-registry.outputs.previous_image != ''
+    
+    steps:
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    
+    - name: Rollback to previous version
+      run: |
+        set -e
+        echo "⚠️  Unit tests failed. Rolling back to previous version..."
+        
+        az containerapp update \
+          --name ${{ env.AZURE_CONTAINER_APP }} \
+          --resource-group ${{ env.AZURE_RG }} \
+          --image ${{ needs.build-and-registry.outputs.previous_image }}
+        
+        echo "✓ Rollback completed"
+        echo "Running on: ${{ needs.build-and-registry.outputs.previous_image }}"
+    
+    - name: Rollback notification
+      run: |
+        echo "### ⚠️ Tests Failed - Rolled Back" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Failed Version:** ${{ needs.build-and-registry.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Rolled Back To:** ${{ needs.build-and-registry.outputs.previous_version }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Reason:** Unit or integration tests failed" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "The container was rolled back to the previous stable version." >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Action Required:** Review test logs to identify the issue." >> $GITHUB_STEP_SUMMARY

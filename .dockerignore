@@ -1,0 +1,12 @@
+wsgi.py
+venv/
+VQA_FrontEnd/
+__pycache__/
+*.pyc
+*.ipynb
+media/
+test/
+vector_db/
+app/archive/
+main_without_lanceDB.py
+build_check.txt
